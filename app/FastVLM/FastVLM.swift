@@ -12,6 +12,58 @@ import MLXLMCommon
 import MLXNN
 import MLXVLM
 import Tokenizers
+import OSLog
+
+private enum PerformanceLogging {
+    static let enabled =
+        ProcessInfo.processInfo.environment["FASTVLM_LOG_TIMING"] == "1"
+
+    static func log(stage: String, start: Date, extra: [String: Any] = [:]) {
+        let ms = Date().timeIntervalSince(start) * 1000
+        log(stage: stage, ms: ms, extra: extra)
+    }
+
+    static func log(stage: String, ms: Double, extra: [String: Any] = [:]) {
+        guard enabled else { return }
+        var payload: [String: Any] = ["stage": stage, "ms": Int(ms.rounded())]
+        extra.forEach { payload[$0.key] = $0.value }
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let line = String(data: data, encoding: .utf8) {
+            print("FASTVLM_TIMING \(line)")
+        }
+    }
+}
+
+private struct VisionPruningConfig {
+    let keepFraction: Double
+    let minTokens: Int
+
+    init() {
+        let env = ProcessInfo.processInfo.environment
+        if let value = env["FASTVLM_KEEP_FRACTION"], let parsed = Double(value), parsed > 0,
+            parsed <= 1
+        {
+            keepFraction = parsed
+        } else {
+            keepFraction = 1.0
+        }
+
+        if let value = env["FASTVLM_MIN_TOKENS"], let parsed = Int(value), parsed > 0 {
+            minTokens = parsed
+        } else {
+            minTokens = 32
+        }
+    }
+
+    var enabled: Bool { keepFraction < 0.999 }
+
+    func targetCount(original: Int) -> Int {
+        let desired = Int((Double(original) * keepFraction).rounded(.toNearestOrAwayFromZero))
+        return max(minTokens, min(original, max(1, desired)))
+    }
+}
+
+private let visionPruning = VisionPruningConfig()
 
 // FastVLM is Qwen2VL with a custom vision tower.
 
@@ -117,8 +169,6 @@ private enum Language {
             values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
 
             let offset = cache?.offset ?? 0
-            let mask = mask?[0..., 0 ..< keys.dim(-2)]
-
             queries = rotaryEmbedding(queries, offset: offset)
             keys = rotaryEmbedding(keys, offset: offset)
 
@@ -126,8 +176,15 @@ private enum Language {
                 (keys, values) = cache.update(keys: keys, values: values)
             }
 
+            let maskConverted: MLXFast.ScaledDotProductAttentionMaskMode =
+                if let mask {
+                    .array(mask[.ellipsis, 0 ..< keys.dim(-2)])
+                } else {
+                    .none
+                }
+
             let output = MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: mask
+                queries: queries, keys: keys, values: values, scale: scale, mask: maskConverted
             )
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
@@ -213,7 +270,7 @@ private enum Language {
                 fatalError("one of inputs or inputEmbedding must be non-nil")
             }
 
-            let mask = createAttentionMask(h: h, cache: cache)
+            let mask: MLXArray? = createAttentionMask(h: h, cache: cache)
 
             for (i, layer) in layers.enumerated() {
                 h = layer(h, mask: mask, cache: cache?[i])
@@ -341,6 +398,7 @@ public class FastVLMProcessor: UserInputProcessor {
     public func preprocess(image: CIImage, processing: UserInput.Processing?) throws -> (
         MLXArray, THW
     ) {
+        let t0 = Date()
         // first apply the user requested resizing, etc. if any
         var image = MediaProcessingExtensions.apply(image, processing: processing)
 
@@ -357,17 +415,35 @@ public class FastVLMProcessor: UserInputProcessor {
             std: imageProcessingConfig.imageStdTuple)
 
         let array = MediaProcessingExtensions.asPlanarMLXArray(image)
-        return (array, .init(0, array.dim(2), array.dim(3)))
+        let thw = THW(0, array.dim(2), array.dim(3))
+        PerformanceLogging.log(
+            stage: "preprocess",
+            start: t0,
+            extra: ["h": thw.h, "w": thw.w, "t": thw.t]
+        )
+        return (array, thw)
+    }
+
+    private func messages(from prompt: UserInput.Prompt) -> [Message] {
+        switch prompt {
+        case .text(let text):
+            return [["role": "user", "content": text]]
+        case .messages(let messages):
+            return messages
+        case .chat(let chatMessages):
+            return chatMessages.map { ["role": $0.role.rawValue, "content": $0.content] }
+        }
     }
 
     public func prepare(prompt: UserInput.Prompt, imageTHW: THW?) -> String {
-        var messages = prompt.asMessages()
-        if messages[0]["role"] != "system" {
+        var messages = messages(from: prompt)
+        let firstRole = messages.first?["role"] as? String ?? ""
+        if firstRole != "system" {
             messages.insert(["role": "system", "content": "You are a helpful assistant."], at: 0)
         }
 
         let lastIndex = messages.count - 1
-        var lastMessage = messages[lastIndex]["content"] ?? ""
+        var lastMessage = (messages[lastIndex]["content"] as? String) ?? ""
 
         // processing_llava.py
         if let imageTHW {
@@ -382,7 +458,9 @@ public class FastVLMProcessor: UserInputProcessor {
                 numImageTokens -= 1
             }
 
-            lastMessage += Array(repeating: config.imageToken, count: numImageTokens)
+            let prunedTokens = visionPruning.targetCount(original: numImageTokens)
+
+            lastMessage += Array(repeating: config.imageToken, count: prunedTokens)
                 .joined()
         }
 
@@ -402,6 +480,11 @@ public class FastVLMProcessor: UserInputProcessor {
             // just a straight text prompt
             let prompt = prepare(prompt: input.prompt, imageTHW: nil)
             let promptTokens = tokenizer.encode(text: prompt)
+            PerformanceLogging.log(
+                stage: "prompt_tokens",
+                ms: 0,
+                extra: ["tokens": promptTokens.count]
+            )
             return LMInput(tokens: MLXArray(promptTokens))
         }
 
@@ -411,10 +494,15 @@ public class FastVLMProcessor: UserInputProcessor {
 
         let (pixels, thw) = try preprocess(
             image: input.images[0].asCIImage(), processing: input.processing)
-        let image = LMInput.ProcessedImage(pixels: pixels, imageGridThw: [thw])
+        let image = LMInput.ProcessedImage(pixels: pixels, frames: [thw])
 
         let prompt = prepare(prompt: input.prompt, imageTHW: thw)
         let promptTokens = tokenizer.encode(text: prompt)
+        PerformanceLogging.log(
+            stage: "prompt_tokens",
+            ms: 0,
+            extra: ["tokens": promptTokens.count]
+        )
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
@@ -499,6 +587,22 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         self._multiModalProjector.wrappedValue = FastVLMMultiModalProjector(config)
     }
 
+    private func pruneVisionTokens(_ features: MLXArray) -> MLXArray {
+        let original = features.dim(1)
+        let keep = visionPruning.targetCount(original: original)
+        guard visionPruning.enabled, keep < original else { return features }
+
+        let scores = (features * features).sum(axis: -1)  // [1, tokens]
+        let scoresArray = scores.asArray(Float.self)
+        let topIndices = scoresArray.enumerated()
+            .sorted { $0.element > $1.element }
+            .prefix(keep)
+            .map { $0.offset }
+            .sorted()
+        let indexArray = MLXArray(topIndices)
+        return features[0..., indexArray, 0...]
+    }
+
     private func inputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, gridThw: [THW]?)
         -> MLXArray
     {
@@ -510,12 +614,34 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         let inputEmbeds = languageModel.model.embedTokens(inputIds)
 
         // Get the ouptut hidden states from the vision model
+        let visionStart = Date()
         let imageFeaturesCoreML = self.visionModel(pixelValues, gridThw: gridThw)
-        let imageFeatures = multiModalProjector(imageFeaturesCoreML)
+        let originalTokens = imageFeaturesCoreML.dim(1)
+        PerformanceLogging.log(
+            stage: "vision_encoder",
+            start: visionStart,
+            extra: [
+                "image_tokens": originalTokens,
+                "h": gridThw.first?.h ?? 0,
+                "w": gridThw.first?.w ?? 0
+            ])
+        let imageFeatures = pruneVisionTokens(imageFeaturesCoreML)
+        let projected = multiModalProjector(imageFeatures)
 
         // Insert special image tokens in the input_ids
-        return mergeInputIdsWithImageFeatures(
-            inputIds: inputIds, inputEmbeds: inputEmbeds, imageFeatures: imageFeatures)
+        let mergeStart = Date()
+        let merged = mergeInputIdsWithImageFeatures(
+            inputIds: inputIds, inputEmbeds: inputEmbeds, imageFeatures: projected)
+        PerformanceLogging.log(
+            stage: "embed_merge",
+            start: mergeStart,
+            extra: [
+                "prompt_tokens": inputIds.dim(1),
+                "image_tokens": projected.dim(1),
+                "image_tokens_original": imageFeaturesCoreML.dim(1),
+                "merged_tokens": merged.dim(1)
+            ])
+        return merged
     }
 
     private func mergeInputIdsWithImageFeatures(
@@ -537,7 +663,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let gridThw = input.image?.imageGridThw
+        let gridThw = input.image?.frames
 
         let dtype = DType.float32
         let pixels = input.image?.pixels.asType(dtype)
@@ -545,7 +671,13 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         let inputEmbeddings = self.inputEmbeddings(
             inputIds: input.text.tokens, pixelValues: pixels, gridThw: gridThw)
 
+        let prefillStart = Date()
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
+        PerformanceLogging.log(
+            stage: "lm_prefill",
+            start: prefillStart,
+            extra: ["seq_len": inputEmbeddings.dim(1)]
+        )
 
         return .logits(result)
     }
