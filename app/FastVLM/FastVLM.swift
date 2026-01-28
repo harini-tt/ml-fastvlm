@@ -37,6 +37,9 @@ private enum PerformanceLogging {
 private struct VisionPruningConfig {
     let keepFraction: Double
     let minTokens: Int
+    let tomeEnabled: Bool
+    let tomeKeepRatio: Double
+    let tomeMinTokens: Int
 
     init() {
         let env = ProcessInfo.processInfo.environment
@@ -53,6 +56,24 @@ private struct VisionPruningConfig {
         } else {
             minTokens = 32
         }
+
+        if let value = env["FASTVLM_TOME_ENABLED"]?.lowercased() {
+            tomeEnabled = (value == "1" || value == "true")
+        } else {
+            tomeEnabled = false
+        }
+        if let value = env["FASTVLM_TOME_KEEP_RATIO"], let parsed = Double(value), parsed > 0,
+            parsed <= 1
+        {
+            tomeKeepRatio = parsed
+        } else {
+            tomeKeepRatio = 0.5
+        }
+        if let value = env["FASTVLM_TOME_MIN_TOKENS"], let parsed = Int(value), parsed > 0 {
+            tomeMinTokens = parsed
+        } else {
+            tomeMinTokens = 64
+        }
     }
 
     var enabled: Bool { keepFraction < 0.999 }
@@ -60,6 +81,18 @@ private struct VisionPruningConfig {
     func targetCount(original: Int) -> Int {
         let desired = Int((Double(original) * keepFraction).rounded(.toNearestOrAwayFromZero))
         return max(minTokens, min(original, max(1, desired)))
+    }
+
+    // Final count after both pruning and ToMe
+    func finalTargetCount(original: Int) -> Int {
+        let afterPruning = targetCount(original: original)
+        if !tomeEnabled {
+            return afterPruning
+        }
+        let afterToMe = max(
+            Int(Double(afterPruning) * tomeKeepRatio),
+            tomeMinTokens)
+        return max(1, min(afterPruning, afterToMe))
     }
 }
 
@@ -458,9 +491,9 @@ public class FastVLMProcessor: UserInputProcessor {
                 numImageTokens -= 1
             }
 
-            let prunedTokens = visionPruning.targetCount(original: numImageTokens)
+            let finalTokens = visionPruning.finalTargetCount(original: numImageTokens)
 
-            lastMessage += Array(repeating: config.imageToken, count: prunedTokens)
+            lastMessage += Array(repeating: config.imageToken, count: finalTokens)
                 .joined()
         }
 
@@ -604,6 +637,89 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         return features[0..., indexArray, 0...]
     }
 
+    private func mergeTokensToMe(_ features: MLXArray) -> MLXArray {
+        // ToMe-style bipartite soft matching: partition tokens, find similar pairs, merge.
+        // Reference: "Token Merging: Your ViT But Faster" (Bolya et al.)
+        let current = features.dim(1)
+        let target = max(
+            Int(Double(current) * visionPruning.tomeKeepRatio),
+            visionPruning.tomeMinTokens)
+        guard visionPruning.tomeEnabled, current > target else { return features }
+
+        var r = current - target
+        let maxMerges = current / 2
+        r = min(r, maxMerges)
+        guard r > 0 else { return features }
+
+        // features shape: [1, tokens, dim] -> work with [tokens, dim]
+        let feats = features.squeezed(axis: 0)  // [tokens, dim]
+        let dim = feats.dim(1)
+        let norms = sqrt((feats * feats).sum(axis: 1, keepDims: true) + 1e-8)
+        let normalized = feats / norms  // [tokens, dim]
+
+        let numTokens = normalized.dim(0)
+        let aIndices = stride(from: 0, to: numTokens, by: 2).map { $0 }
+        let bIndices = stride(from: 1, to: numTokens, by: 2).map { $0 }
+
+        guard !aIndices.isEmpty && !bIndices.isEmpty else { return features }
+
+        let aTokens = normalized[MLXArray(aIndices), 0...]  // [|A|, dim]
+        let bTokens = normalized[MLXArray(bIndices), 0...]  // [|B|, dim]
+        let aFeats = feats[MLXArray(aIndices), 0...]
+        let bFeats = feats[MLXArray(bIndices), 0...]
+
+        // Cosine similarity: A @ B^T -> [|A|, |B|]
+        let similarity = matmul(aTokens, bTokens.transposed())
+
+        let maxSimIndices = argMax(similarity, axis: 1)
+        let maxSimValues = MLX.max(similarity, axis: 1)
+
+        let simScores = maxSimValues.asArray(Float.self)
+        let sortedAIndices = simScores.enumerated()
+            .sorted { $0.element > $1.element }
+            .map { $0.offset }
+
+        let maxSimIndicesArr = maxSimIndices.asArray(Int32.self)
+        var usedB = Set<Int>()
+        var mergePairs: [(Int, Int)] = []
+
+        for aIdx in sortedAIndices {
+            guard mergePairs.count < r else { break }
+            let bIdx = Int(maxSimIndicesArr[aIdx])
+            if !usedB.contains(bIdx) {
+                mergePairs.append((aIdx, bIdx))
+                usedB.insert(bIdx)
+            }
+        }
+
+        let mergedAIndices = Set(mergePairs.map { $0.0 })
+        let mergedBIndices = Set(mergePairs.map { $0.1 })
+
+        var resultTokens: [MLXArray] = []
+
+        for (aIdx, bIdx) in mergePairs {
+            let merged = (aFeats[aIdx] + bFeats[bIdx]) * 0.5
+            resultTokens.append(merged.expandedDimensions(axis: 0))
+        }
+
+        for (i, _) in aIndices.enumerated() {
+            if !mergedAIndices.contains(i) {
+                resultTokens.append(aFeats[i].expandedDimensions(axis: 0))
+            }
+        }
+
+        for (i, _) in bIndices.enumerated() {
+            if !mergedBIndices.contains(i) {
+                resultTokens.append(bFeats[i].expandedDimensions(axis: 0))
+            }
+        }
+
+        guard !resultTokens.isEmpty else { return features }
+
+        let merged = concatenated(resultTokens, axis: 0)  // [newTokens, dim]
+        return merged.expandedDimensions(axis: 0)  // [1, newTokens, dim]
+    }
+
     private func inputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, gridThw: [THW]?)
         -> MLXArray
     {
@@ -627,7 +743,10 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
                 "w": gridThw.first?.w ?? 0
             ])
         let imageFeatures = pruneVisionTokens(imageFeaturesCoreML)
-        let projected = multiModalProjector(imageFeatures)
+        let imageTokensPruned = imageFeatures.dim(1)
+        let mergedFeatures = mergeTokensToMe(imageFeatures)
+        let imageTokensMerged = mergedFeatures.dim(1)
+        let projected = multiModalProjector(mergedFeatures)
 
         // Insert special image tokens in the input_ids
         let mergeStart = Date()
@@ -640,6 +759,8 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
                 "prompt_tokens": inputIds.dim(1),
                 "image_tokens": projected.dim(1),
                 "image_tokens_original": imageFeaturesCoreML.dim(1),
+                "image_tokens_pruned": imageTokensPruned,
+                "image_tokens_merged": imageTokensMerged,
                 "merged_tokens": merged.dim(1)
             ])
         return merged
@@ -657,7 +778,17 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
             }
         }
 
-        inputEmbeds[0..., MLXArray(imageIndices), 0...] = imageFeatures
+        let placeholders = imageIndices.count
+        let featureCount = imageFeatures.dim(1)
+        var feats = imageFeatures
+
+        if featureCount > placeholders {
+            feats = feats[0..., 0 ..< placeholders, 0...]
+        } else if featureCount < placeholders {
+            imageIndices = Array(imageIndices.prefix(featureCount))
+        }
+
+        inputEmbeds[0..., MLXArray(imageIndices), 0...] = feats
         return inputEmbeds
     }
 
