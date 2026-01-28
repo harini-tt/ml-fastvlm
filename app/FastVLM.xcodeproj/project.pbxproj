@@ -21,6 +21,8 @@
 		C3ED545B2D790AD6005E20B3 /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = C3ED545A2D790AD6005E20B3 /* Transformers */; };
 		C3ED55012D7A0A7A005E20B3 /* FastVLM.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C39BB3E62D79082A005DB8FB /* FastVLM.framework */; };
 		C3ED55022D7A0A7A005E20B3 /* FastVLM.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = C39BB3E62D79082A005DB8FB /* FastVLM.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		D3F1E1012E01234500AAA001 /* FastVLM/model in Resources */ = {isa = PBXBuildFile; fileRef = D3F1E1002E01234500AAA001 /* FastVLM/model */; };
+		D3F1E1022E01234500AAA001 /* FastVLM/model in Resources */ = {isa = PBXBuildFile; fileRef = D3F1E1002E01234500AAA001 /* FastVLM/model */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -61,6 +63,7 @@
 		12FFAF3E2DC93583009C4EFA /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		C35372AE2D08C32D00474D34 /* Video.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Video.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		C39BB3E62D79082A005DB8FB /* FastVLM.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = FastVLM.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		D3F1E1002E01234500AAA001 /* FastVLM/model */ = {isa = PBXFileReference; lastKnownFileType = folder; path = FastVLM/model; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -165,6 +168,7 @@
 				C35372AF2D08C32D00474D34 /* Video */,
 				019A3E0B2D78E6A00055F93B /* FastVLM App */,
 				C39BB3E72D79082A005DB8FB /* FastVLM */,
+				D3F1E1002E01234500AAA001 /* FastVLM/model */,
 				C35EDB7F2D076C3C00757E80 /* Frameworks */,
 				C35EDB702D076A5A00757E80 /* Products */,
 			);
@@ -341,6 +345,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D3F1E1012E01234500AAA001 /* FastVLM/model in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -355,6 +360,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D3F1E1022E01234500AAA001 /* FastVLM/model in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

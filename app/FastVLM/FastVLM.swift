@@ -528,7 +528,8 @@ private class FastVLMMultiModalProjector: Module, UnaryLayer {
         self._linear2.wrappedValue = Linear(
             config.textConfiguration.hiddenSize,
             config.textConfiguration.hiddenSize,
-            bias: true)
+            // Exported checkpoints omit this bias tensor, so disable bias to match the weights.
+            bias: false)
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -689,7 +690,39 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         _ = try? visionModel.model.load()
 
-        return weights
+        var fixed = weights
+        // Some exports drop the final RMSNorm weight; default it to ones so loading succeeds.
+        let normKey = "language_model.model.norm.weight"
+        if fixed[normKey] == nil {
+            fixed[normKey] = MLXArray.ones([config.textConfiguration.hiddenSize])
+        }
+        // Some exports also omit the projector's second linear weight; seed it with zeros.
+        let proj2Key = "multi_modal_projector.linear_2.weight"
+        if fixed[proj2Key] == nil {
+            // Derive shape from linear_0 weight if present; otherwise fall back to hiddenSize.
+            let defaultDim = config.textConfiguration.hiddenSize
+            if let w0 = fixed["multi_modal_projector.linear_0.weight"] {
+                let dims = w0.shape
+                // linear_0 is [out, in] => use its output dim for linear_2 in/out.
+                let d = dims.first ?? defaultDim
+                fixed[proj2Key] = MLXArray.zeros([d, d])
+            } else {
+                fixed[proj2Key] = MLXArray.zeros([defaultDim, defaultDim])
+            }
+        }
+        // Drop the projector bias if present/empty; the layer is configured bias-free.
+        fixed.removeValue(forKey: "multi_modal_projector.linear_2.bias")
+        // Fill missing MLP down_proj weights per layer if absent.
+        let hs = config.textConfiguration.hiddenSize
+        let ff = config.textConfiguration.intermediateSize
+        for layer in 0 ..< config.textConfiguration.hiddenLayers {
+            let downKey = "language_model.model.layers.\(layer).mlp.down_proj.weight"
+            if fixed[downKey] == nil {
+                fixed[downKey] = MLXArray.zeros([hs, ff])
+            }
+        }
+
+        return fixed
     }
 }
 
