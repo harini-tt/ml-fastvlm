@@ -18,12 +18,14 @@ let FRAME_DELAY = Duration.milliseconds(1)
 struct ContentView: View {
     @State private var camera = CameraController()
     @State private var model = FastVLMModel()
+    @State private var researchContext = ResearchContext()
 
     /// stream of frames -> VideoFrameView, see distributeVideoFrames
     @State private var framesToDisplay: AsyncStream<CVImageBuffer>?
 
     @State private var prompt = "Describe the image in English."
     @State private var promptSuffix = "Output should be brief, about 15 words or less."
+    @State private var useResearchContext = false
 
     @State private var isShowingInfo: Bool = false
 
@@ -202,6 +204,7 @@ struct ContentView: View {
             }
             .task {
                 await model.load()
+                researchContext.load()
             }
 
             #if !os(macOS)
@@ -264,6 +267,16 @@ struct ContentView: View {
                             Button("Read text") {
                                 prompt = "What is written in this image?"
                                 promptSuffix = "Output only the text in the image."
+                            }
+                            Button("Research mode") {
+                                prompt = "Analyze this figure/chart in the context of ML research."
+                                promptSuffix = "Explain key findings and relate to recent papers."
+                                useResearchContext = true
+                            }
+                            Divider()
+                            Toggle("Use Research Context", isOn: $useResearchContext)
+                            if researchContext.isLoaded {
+                                Text("\(researchContext.chunkCount) chunks loaded")
                             }
                             #if !os(macOS)
                             Button("Customize...") {
@@ -359,13 +372,22 @@ struct ContentView: View {
         }
     }
 
+    func buildPrompt() -> String {
+        let basePrompt = "\(prompt) \(promptSuffix)"
+        if useResearchContext && researchContext.isLoaded {
+            return researchContext.buildContextPrompt(for: prompt, basePrompt: basePrompt)
+        }
+        return basePrompt
+    }
+
     func analyzeVideoFrames(_ frames: AsyncStream<CVImageBuffer>) async {
         for await frame in frames {
+            let fullPrompt = await MainActor.run { buildPrompt() }
             let userInput = UserInput(
-                prompt: .text("\(prompt) \(promptSuffix)"),
+                prompt: .text(fullPrompt),
                 images: [.ciImage(CIImage(cvPixelBuffer: frame))]
             )
-            
+
             // generate output for a frame and wait for generation to complete
             let t = await model.generate(userInput)
             _ = await t.result
@@ -435,9 +457,10 @@ struct ContentView: View {
             model.output = ""
         }
 
-        // Construct request to model
+        // Construct request to model with context
+        let fullPrompt = buildPrompt()
         let userInput = UserInput(
-            prompt: .text("\(prompt) \(promptSuffix)"),
+            prompt: .text(fullPrompt),
             images: [.ciImage(CIImage(cvPixelBuffer: frame))]
         )
 
