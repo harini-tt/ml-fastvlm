@@ -78,12 +78,12 @@
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "FASTVLM_CACHE_THRESHOLD"
-            value = "0.85"
+            value = "0.90"
             isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "FASTVLM_MAX_SKIP_FRAMES"
-            value = "5"
+            value = "3"
             isEnabled = "YES">
          </EnvironmentVariable>
       </EnvironmentVariables>

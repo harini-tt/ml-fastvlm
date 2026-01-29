@@ -143,13 +143,27 @@ private class FrameBuffer {
     var prevPixels: MLXArray?
     var prevResult: PrepareResult?
     var prevInputEmbeddings: MLXArray?
+    var prevKVStates: [[MLXArray]]?  // KV cache states for each layer
     var skipCount: Int = 0
 
     func reset() {
         prevPixels = nil
         prevResult = nil
         prevInputEmbeddings = nil
+        prevKVStates = nil
         skipCount = 0
+    }
+
+    func saveKVCache(_ cache: [any KVCache]) {
+        prevKVStates = cache.map { $0.state }
+    }
+
+    func restoreKVCache(_ cache: [any KVCache]) {
+        guard let savedStates = prevKVStates, savedStates.count == cache.count else { return }
+        var mutableCache = cache
+        for (i, state) in savedStates.enumerated() {
+            mutableCache[i].state = state
+        }
     }
 }
 
@@ -910,17 +924,18 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
 
             switch action {
             case .skip:
-                if let cachedResult = frameBuffer.prevResult {
+                // Full skip: restore KV cache and return cached result
+                if let cachedResult = frameBuffer.prevResult, frameBuffer.prevKVStates != nil {
+                    frameBuffer.restoreKVCache(cache)
                     frameBuffer.skipCount += 1
                     PerformanceLogging.log(
                         stage: "frame_skipped",
                         ms: 0,
-                        extra: ["skip_count": frameBuffer.skipCount]
+                        extra: ["skip_count": frameBuffer.skipCount, "kv_restored": true]
                     )
                     return cachedResult
                 }
             case .cache:
-                // Reuse vision embeddings, only re-run LM
                 if let cachedEmbeddings = frameBuffer.prevInputEmbeddings {
                     frameBuffer.skipCount += 1
                     PerformanceLogging.log(
@@ -940,6 +955,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
                     let prepareResult = PrepareResult.logits(result)
                     frameBuffer.prevPixels = currPixels
                     frameBuffer.prevResult = prepareResult
+                    frameBuffer.saveKVCache(cache)
                     // Keep prevInputEmbeddings the same since we're reusing
                     return prepareResult
                 }
@@ -966,6 +982,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
             frameBuffer.prevPixels = currPixels
             frameBuffer.prevResult = prepareResult
             frameBuffer.prevInputEmbeddings = inputEmbeddings
+            frameBuffer.saveKVCache(cache)
         }
 
         return prepareResult
