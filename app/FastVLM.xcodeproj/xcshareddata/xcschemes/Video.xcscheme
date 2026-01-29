@@ -62,13 +62,28 @@
             isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable
-            key = "FASTVLM_TOME_MIN_TOKENS"
-            value = "64"
-            isEnabled = "NO">
-         </EnvironmentVariable>
-         <EnvironmentVariable
             key = "FASTVLM_LOG_TIMING"
             value = "1"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "FASTVLM_FRAMESKIP_ENABLED"
+            value = "1"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "FASTVLM_SKIP_THRESHOLD"
+            value = "0.98"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "FASTVLM_CACHE_THRESHOLD"
+            value = "0.85"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "FASTVLM_MAX_SKIP_FRAMES"
+            value = "5"
             isEnabled = "YES">
          </EnvironmentVariable>
       </EnvironmentVariables>
