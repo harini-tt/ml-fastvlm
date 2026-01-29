@@ -122,21 +122,42 @@ class ResearchContext: ObservableObject {
     func buildContextPrompt(for query: String, basePrompt: String) -> String {
         let relevant = search(query: query, topK: 3)
 
+        let systemPrompt = """
+        You are an expert ML researcher analyzing visual content. Your role:
+
+        1. ANALYZE precisely: Identify what type of content this is (figure, graph, table, equation, diagram, code, whiteboard)
+
+        2. EXTRACT key insights: What is the main finding or claim? What do the axes/labels show? What trends or patterns are visible?
+
+        3. CONNECT to literature: If context is provided, relate what you see to the referenced papers. Note agreements, contradictions, or extensions.
+
+        4. BE CRITICAL: Point out potential issues - missing error bars, cherry-picked results, unfair comparisons, or misleading visualizations.
+
+        5. SUGGEST next steps: What experiment would you run next? What hypothesis does this support or refute?
+
+        Be concise but insightful. Avoid generic descriptions.
+        """
+
         if relevant.isEmpty {
-            return basePrompt
+            return """
+            \(systemPrompt)
+
+            \(basePrompt)
+            """
         }
 
-        var context = "Relevant research context:\n"
+        var context = "\n---\nRelevant papers from your library:\n"
         for (i, chunk) in relevant.enumerated() {
-            context += "\n[\(i+1)] From \(chunk.source) (p.\(chunk.page)):\n"
-            context += chunk.text.prefix(400) + "...\n"
+            let source = chunk.source.replacingOccurrences(of: ".pdf", with: "")
+            context += "\n[\(i+1)] \(source) (p.\(chunk.page)):\n"
+            context += String(chunk.text.prefix(500)) + "\n"
         }
+        context += "---\n"
 
         return """
+        \(systemPrompt)
         \(context)
-
-        Based on the above research context and what you see in the image:
-        \(basePrompt)
+        Now analyze the image. \(basePrompt)
         """
     }
 }

@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var camera = CameraController()
     @State private var model = FastVLMModel()
     @State private var researchContext = ResearchContext()
+    @State private var insightStore = InsightStore()
 
     /// stream of frames -> VideoFrameView, see distributeVideoFrames
     @State private var framesToDisplay: AsyncStream<CVImageBuffer>?
@@ -28,6 +29,8 @@ struct ContentView: View {
     @State private var useResearchContext = false
 
     @State private var isShowingInfo: Bool = false
+    @State private var isMemoryExpanded: Bool = false
+    @State private var expandedInsightId: UUID? = nil
 
     @State private var selectedCameraType: CameraType = .continuous
     @State private var isEditingPrompt: Bool = false
@@ -164,6 +167,8 @@ struct ContentView: View {
 
                 promptSections
 
+                memorySection
+
                 Section {
                     if model.output.isEmpty && model.running {
                         ProgressView()
@@ -205,6 +210,7 @@ struct ContentView: View {
             .task {
                 await model.load()
                 researchContext.load()
+                model.insightStore = insightStore
             }
 
             #if !os(macOS)
@@ -269,8 +275,8 @@ struct ContentView: View {
                                 promptSuffix = "Output only the text in the image."
                             }
                             Button("Research mode") {
-                                prompt = "Analyze this figure/chart in the context of ML research."
-                                promptSuffix = "Explain key findings and relate to recent papers."
+                                prompt = "What is this showing and what's the key insight?"
+                                promptSuffix = ""
                                 useResearchContext = true
                             }
                             Divider()
@@ -372,6 +378,119 @@ struct ContentView: View {
         }
     }
 
+    var memorySection: some View {
+        Section {
+            if insightStore.recentInsights.isEmpty {
+                Text("No insights saved yet")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            } else {
+                DisclosureGroup(
+                    isExpanded: $isMemoryExpanded,
+                    content: {
+                        ForEach(insightStore.recentInsights.prefix(5)) { insight in
+                            insightRow(insight)
+                        }
+                        .onDelete { indexSet in
+                            for index in indexSet {
+                                if index < insightStore.recentInsights.count {
+                                    insightStore.delete(insightStore.recentInsights[index].id)
+                                }
+                            }
+                        }
+                    },
+                    label: {
+                        HStack {
+                            Image(systemName: "brain")
+                                .foregroundStyle(.purple)
+                            Text("Memory")
+                            Spacer()
+                            Text("\(insightStore.recentInsights.count) insights")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                )
+            }
+        } header: {
+            Text("Memory")
+                #if os(macOS)
+                .font(.headline)
+                .padding(.bottom, 2.0)
+                #endif
+        }
+    }
+
+    func insightRow(_ insight: Insight) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(relativeTimeString(from: insight.timestamp))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !insight.sources.isEmpty {
+                    Text("\(insight.sources.count) sources")
+                        .font(.caption2)
+                        .foregroundStyle(.purple)
+                }
+            }
+
+            Text(insight.query)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .lineLimit(expandedInsightId == insight.id ? nil : 1)
+
+            if expandedInsightId == insight.id {
+                Text(insight.output)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+
+                if !insight.sources.isEmpty {
+                    HStack {
+                        ForEach(insight.sources, id: \.self) { source in
+                            Text(source)
+                                .font(.caption2)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.purple.opacity(0.1))
+                                .cornerRadius(4)
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation {
+                if expandedInsightId == insight.id {
+                    expandedInsightId = nil
+                } else {
+                    expandedInsightId = insight.id
+                }
+            }
+        }
+    }
+
+    func relativeTimeString(from date: Date) -> String {
+        let interval = Date().timeIntervalSince(date)
+
+        if interval < 60 {
+            return "Just now"
+        } else if interval < 3600 {
+            let minutes = Int(interval / 60)
+            return "\(minutes) min ago"
+        } else if interval < 86400 {
+            let hours = Int(interval / 3600)
+            return "\(hours) hr ago"
+        } else {
+            let days = Int(interval / 86400)
+            return days == 1 ? "Yesterday" : "\(days) days ago"
+        }
+    }
+
     func buildPrompt() -> String {
         let basePrompt = "\(prompt) \(promptSuffix)"
         if useResearchContext && researchContext.isLoaded {
@@ -380,9 +499,24 @@ struct ContentView: View {
         return basePrompt
     }
 
+    func prepareModelForGeneration() {
+        model.lastQuery = prompt
+        model.shouldSaveInsight = useResearchContext
+
+        if useResearchContext && researchContext.isLoaded {
+            let relevantChunks = researchContext.search(query: prompt, topK: 3)
+            model.lastSources = relevantChunks.map { $0.source.replacingOccurrences(of: ".pdf", with: "") }
+        } else {
+            model.lastSources = []
+        }
+    }
+
     func analyzeVideoFrames(_ frames: AsyncStream<CVImageBuffer>) async {
         for await frame in frames {
-            let fullPrompt = await MainActor.run { buildPrompt() }
+            let fullPrompt = await MainActor.run {
+                prepareModelForGeneration()
+                return buildPrompt()
+            }
             let userInput = UserInput(
                 prompt: .text(fullPrompt),
                 images: [.ciImage(CIImage(cvPixelBuffer: frame))]
@@ -456,6 +590,9 @@ struct ContentView: View {
         Task { @MainActor in
             model.output = ""
         }
+
+        // Prepare for insight saving if in research mode
+        prepareModelForGeneration()
 
         // Construct request to model with context
         let fullPrompt = buildPrompt()
