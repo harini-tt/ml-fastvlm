@@ -37,6 +37,9 @@ private enum PerformanceLogging {
 private struct VisionPruningConfig {
     let keepFraction: Double
     let minTokens: Int
+    let tomeEnabled: Bool
+    let tomeKeepRatio: Double
+    let tomeMinTokens: Int
 
     init() {
         let env = ProcessInfo.processInfo.environment
@@ -53,6 +56,24 @@ private struct VisionPruningConfig {
         } else {
             minTokens = 32
         }
+
+        if let value = env["FASTVLM_TOME_ENABLED"]?.lowercased() {
+            tomeEnabled = (value == "1" || value == "true")
+        } else {
+            tomeEnabled = false
+        }
+        if let value = env["FASTVLM_TOME_KEEP_RATIO"], let parsed = Double(value), parsed > 0,
+            parsed <= 1
+        {
+            tomeKeepRatio = parsed
+        } else {
+            tomeKeepRatio = 0.5
+        }
+        if let value = env["FASTVLM_TOME_MIN_TOKENS"], let parsed = Int(value), parsed > 0 {
+            tomeMinTokens = parsed
+        } else {
+            tomeMinTokens = 64
+        }
     }
 
     var enabled: Bool { keepFraction < 0.999 }
@@ -61,9 +82,123 @@ private struct VisionPruningConfig {
         let desired = Int((Double(original) * keepFraction).rounded(.toNearestOrAwayFromZero))
         return max(minTokens, min(original, max(1, desired)))
     }
+
+    // Final count after both pruning and ToMe
+    func finalTargetCount(original: Int) -> Int {
+        let afterPruning = targetCount(original: original)
+        if !tomeEnabled {
+            return afterPruning
+        }
+        let afterToMe = max(
+            Int(Double(afterPruning) * tomeKeepRatio),
+            tomeMinTokens)
+        return max(1, min(afterPruning, afterToMe))
+    }
 }
 
 private let visionPruning = VisionPruningConfig()
+
+// MARK: - Frame Skipping
+
+private enum FrameAction {
+    case skip       // sim > 0.99: reuse entire output
+    case cache      // 0.95-0.99: reuse vision embeddings (future)
+    case keyframe   // < 0.95: full inference
+}
+
+private struct FrameSkipConfig {
+    let enabled: Bool
+    let skipThreshold: Double    // above this = skip entirely
+    let cacheThreshold: Double   // above this = cache vision
+    let maxSkipFrames: Int       // force keyframe after N skips
+
+    init() {
+        let env = ProcessInfo.processInfo.environment
+        if let value = env["FASTVLM_FRAMESKIP_ENABLED"]?.lowercased() {
+            enabled = (value == "1" || value == "true")
+        } else {
+            enabled = false
+        }
+        if let value = env["FASTVLM_SKIP_THRESHOLD"], let parsed = Double(value) {
+            skipThreshold = parsed
+        } else {
+            skipThreshold = 0.99
+        }
+        if let value = env["FASTVLM_CACHE_THRESHOLD"], let parsed = Double(value) {
+            cacheThreshold = parsed
+        } else {
+            cacheThreshold = 0.95
+        }
+        if let value = env["FASTVLM_MAX_SKIP_FRAMES"], let parsed = Int(value) {
+            maxSkipFrames = parsed
+        } else {
+            maxSkipFrames = 5
+        }
+    }
+}
+
+private let frameSkipConfig = FrameSkipConfig()
+
+private class FrameBuffer {
+    var prevPixels: MLXArray?
+    var prevResult: PrepareResult?
+    var prevInputEmbeddings: MLXArray?
+    var prevKVStates: [[MLXArray]]?  // KV cache states for each layer
+    var skipCount: Int = 0
+
+    func reset() {
+        prevPixels = nil
+        prevResult = nil
+        prevInputEmbeddings = nil
+        prevKVStates = nil
+        skipCount = 0
+    }
+
+    func saveKVCache(_ cache: [any KVCache]) {
+        prevKVStates = cache.map { $0.state }
+    }
+
+    func restoreKVCache(_ cache: [any KVCache]) {
+        guard let savedStates = prevKVStates, savedStates.count == cache.count else { return }
+        var mutableCache = cache
+        for (i, state) in savedStates.enumerated() {
+            mutableCache[i].state = state
+        }
+    }
+}
+
+private func histogramSimilarity(_ curr: MLXArray, _ prev: MLXArray) -> Double {
+    // Fast similarity - just sample center 64x64 region
+    // Input: [1, 3, H, W]
+    let h = curr.dim(2)
+    let w = curr.dim(3)
+    let cy = h / 2
+    let cx = w / 2
+    let sz = 32
+
+    let currPatch = curr[0..., 0..., (cy - sz) ..< (cy + sz), (cx - sz) ..< (cx + sz)]
+    let prevPatch = prev[0..., 0..., (cy - sz) ..< (cy + sz), (cx - sz) ..< (cx + sz)]
+
+    let diff = currPatch - prevPatch
+    let mse = (diff * diff).mean()
+    let mseVal = mse.asArray(Float.self).first ?? Float.infinity  // forces eval
+    let similarity = 1.0 - min(Double(mseVal) * 10, 1.0)
+    return similarity
+}
+
+private func decideFrameAction(_ similarity: Double, skipCount: Int) -> FrameAction {
+    // Force keyframe if we've skipped too many
+    if skipCount >= frameSkipConfig.maxSkipFrames {
+        return .keyframe
+    }
+    if similarity > frameSkipConfig.skipThreshold {
+        return .skip
+    }
+    if similarity > frameSkipConfig.cacheThreshold {
+        return .cache  // for now treated same as keyframe
+    }
+    return .keyframe
+}
 
 // FastVLM is Qwen2VL with a custom vision tower.
 
@@ -458,9 +593,9 @@ public class FastVLMProcessor: UserInputProcessor {
                 numImageTokens -= 1
             }
 
-            let prunedTokens = visionPruning.targetCount(original: numImageTokens)
+            let finalTokens = visionPruning.finalTargetCount(original: numImageTokens)
 
-            lastMessage += Array(repeating: config.imageToken, count: prunedTokens)
+            lastMessage += Array(repeating: config.imageToken, count: finalTokens)
                 .joined()
         }
 
@@ -573,12 +708,17 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         FastVLMMultiModalProjector
 
     public let config: FastVLMConfiguration
+    private let frameBuffer = FrameBuffer()
 
     public var vocabularySize: Int { config.baseConfiguration.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
     public func loraLinearLayers() -> MLXLMCommon.LoRALinearLayers {
         languageModel.model.layers.map { ($0.attention, ["q_proj", "v_proj"]) }
+    }
+
+    public func resetFrameBuffer() {
+        frameBuffer.reset()
     }
 
     public init(_ config: FastVLMConfiguration) {
@@ -604,6 +744,89 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         return features[0..., indexArray, 0...]
     }
 
+    private func mergeTokensToMe(_ features: MLXArray) -> MLXArray {
+        // ToMe-style bipartite soft matching: partition tokens, find similar pairs, merge.
+        // Reference: "Token Merging: Your ViT But Faster" (Bolya et al.)
+        let current = features.dim(1)
+        let target = max(
+            Int(Double(current) * visionPruning.tomeKeepRatio),
+            visionPruning.tomeMinTokens)
+        guard visionPruning.tomeEnabled, current > target else { return features }
+
+        var r = current - target
+        let maxMerges = current / 2
+        r = min(r, maxMerges)
+        guard r > 0 else { return features }
+
+        // features shape: [1, tokens, dim] -> work with [tokens, dim]
+        let feats = features.squeezed(axis: 0)  // [tokens, dim]
+        let dim = feats.dim(1)
+        let norms = sqrt((feats * feats).sum(axis: 1, keepDims: true) + 1e-8)
+        let normalized = feats / norms  // [tokens, dim]
+
+        let numTokens = normalized.dim(0)
+        let aIndices = stride(from: 0, to: numTokens, by: 2).map { $0 }
+        let bIndices = stride(from: 1, to: numTokens, by: 2).map { $0 }
+
+        guard !aIndices.isEmpty && !bIndices.isEmpty else { return features }
+
+        let aTokens = normalized[MLXArray(aIndices), 0...]  // [|A|, dim]
+        let bTokens = normalized[MLXArray(bIndices), 0...]  // [|B|, dim]
+        let aFeats = feats[MLXArray(aIndices), 0...]
+        let bFeats = feats[MLXArray(bIndices), 0...]
+
+        // Cosine similarity: A @ B^T -> [|A|, |B|]
+        let similarity = matmul(aTokens, bTokens.transposed())
+
+        let maxSimIndices = argMax(similarity, axis: 1)
+        let maxSimValues = MLX.max(similarity, axis: 1)
+
+        let simScores = maxSimValues.asArray(Float.self)
+        let sortedAIndices = simScores.enumerated()
+            .sorted { $0.element > $1.element }
+            .map { $0.offset }
+
+        let maxSimIndicesArr = maxSimIndices.asArray(Int32.self)
+        var usedB = Set<Int>()
+        var mergePairs: [(Int, Int)] = []
+
+        for aIdx in sortedAIndices {
+            guard mergePairs.count < r else { break }
+            let bIdx = Int(maxSimIndicesArr[aIdx])
+            if !usedB.contains(bIdx) {
+                mergePairs.append((aIdx, bIdx))
+                usedB.insert(bIdx)
+            }
+        }
+
+        let mergedAIndices = Set(mergePairs.map { $0.0 })
+        let mergedBIndices = Set(mergePairs.map { $0.1 })
+
+        var resultTokens: [MLXArray] = []
+
+        for (aIdx, bIdx) in mergePairs {
+            let merged = (aFeats[aIdx] + bFeats[bIdx]) * 0.5
+            resultTokens.append(merged.expandedDimensions(axis: 0))
+        }
+
+        for (i, _) in aIndices.enumerated() {
+            if !mergedAIndices.contains(i) {
+                resultTokens.append(aFeats[i].expandedDimensions(axis: 0))
+            }
+        }
+
+        for (i, _) in bIndices.enumerated() {
+            if !mergedBIndices.contains(i) {
+                resultTokens.append(bFeats[i].expandedDimensions(axis: 0))
+            }
+        }
+
+        guard !resultTokens.isEmpty else { return features }
+
+        let merged = concatenated(resultTokens, axis: 0)  // [newTokens, dim]
+        return merged.expandedDimensions(axis: 0)  // [1, newTokens, dim]
+    }
+
     private func inputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, gridThw: [THW]?)
         -> MLXArray
     {
@@ -627,7 +850,10 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
                 "w": gridThw.first?.w ?? 0
             ])
         let imageFeatures = pruneVisionTokens(imageFeaturesCoreML)
-        let projected = multiModalProjector(imageFeatures)
+        let imageTokensPruned = imageFeatures.dim(1)
+        let mergedFeatures = mergeTokensToMe(imageFeatures)
+        let imageTokensMerged = mergedFeatures.dim(1)
+        let projected = multiModalProjector(mergedFeatures)
 
         // Insert special image tokens in the input_ids
         let mergeStart = Date()
@@ -640,6 +866,8 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
                 "prompt_tokens": inputIds.dim(1),
                 "image_tokens": projected.dim(1),
                 "image_tokens_original": imageFeaturesCoreML.dim(1),
+                "image_tokens_pruned": imageTokensPruned,
+                "image_tokens_merged": imageTokensMerged,
                 "merged_tokens": merged.dim(1)
             ])
         return merged
@@ -657,7 +885,17 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
             }
         }
 
-        inputEmbeds[0..., MLXArray(imageIndices), 0...] = imageFeatures
+        let placeholders = imageIndices.count
+        let featureCount = imageFeatures.dim(1)
+        var feats = imageFeatures
+
+        if featureCount > placeholders {
+            feats = feats[0..., 0 ..< placeholders, 0...]
+        } else if featureCount < placeholders {
+            imageIndices = Array(imageIndices.prefix(featureCount))
+        }
+
+        inputEmbeds[0..., MLXArray(imageIndices), 0...] = feats
         return inputEmbeds
     }
 
@@ -668,6 +906,63 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
 
         let dtype = DType.float32
         let pixels = input.image?.pixels.asType(dtype)
+
+        // Frame skipping logic
+        if frameSkipConfig.enabled, let currPixels = pixels, let prevPixels = frameBuffer.prevPixels {
+            let simStart = Date()
+            let similarity = histogramSimilarity(currPixels, prevPixels)
+            let action = decideFrameAction(similarity, skipCount: frameBuffer.skipCount)
+            PerformanceLogging.log(
+                stage: "frame_similarity",
+                start: simStart,
+                extra: [
+                    "similarity": String(format: "%.4f", similarity),
+                    "action": String(describing: action),
+                    "skip_count": frameBuffer.skipCount
+                ]
+            )
+
+            switch action {
+            case .skip:
+                // Full skip: restore KV cache and return cached result
+                if let cachedResult = frameBuffer.prevResult, frameBuffer.prevKVStates != nil {
+                    frameBuffer.restoreKVCache(cache)
+                    frameBuffer.skipCount += 1
+                    PerformanceLogging.log(
+                        stage: "frame_skipped",
+                        ms: 0,
+                        extra: ["skip_count": frameBuffer.skipCount, "kv_restored": true]
+                    )
+                    return cachedResult
+                }
+            case .cache:
+                if let cachedEmbeddings = frameBuffer.prevInputEmbeddings {
+                    frameBuffer.skipCount += 1
+                    PerformanceLogging.log(
+                        stage: "vision_cached",
+                        ms: 0,
+                        extra: ["skip_count": frameBuffer.skipCount]
+                    )
+
+                    let prefillStart = Date()
+                    let result = languageModel(nil, cache: cache, inputEmbedding: cachedEmbeddings)
+                    PerformanceLogging.log(
+                        stage: "lm_prefill",
+                        start: prefillStart,
+                        extra: ["seq_len": cachedEmbeddings.dim(1), "vision_cached": true]
+                    )
+
+                    let prepareResult = PrepareResult.logits(result)
+                    frameBuffer.prevPixels = currPixels
+                    frameBuffer.prevResult = prepareResult
+                    frameBuffer.saveKVCache(cache)
+                    // Keep prevInputEmbeddings the same since we're reusing
+                    return prepareResult
+                }
+            case .keyframe:
+                frameBuffer.skipCount = 0
+            }
+        }
 
         let inputEmbeddings = self.inputEmbeddings(
             inputIds: input.text.tokens, pixelValues: pixels, gridThw: gridThw)
@@ -680,7 +975,17 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
             extra: ["seq_len": inputEmbeddings.dim(1)]
         )
 
-        return .logits(result)
+        let prepareResult = PrepareResult.logits(result)
+
+        // Cache for frame skipping
+        if frameSkipConfig.enabled, let currPixels = pixels {
+            frameBuffer.prevPixels = currPixels
+            frameBuffer.prevResult = prepareResult
+            frameBuffer.prevInputEmbeddings = inputEmbeddings
+            frameBuffer.saveKVCache(cache)
+        }
+
+        return prepareResult
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

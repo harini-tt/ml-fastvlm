@@ -141,3 +141,6 @@ dmypy.json
 # FastVLM models
 app/FastVLM/model
 app/FastVLM.xcodeproj/xcuserdata/
+
+# Paper embeddings
+app/FastVLM App/paper_embeddings.json
