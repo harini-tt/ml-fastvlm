@@ -9,12 +9,12 @@ import SwiftUI
 public struct CameraControlsView: View {
 
     @Binding public var backCamera: Bool
-    @Binding public var device: AVCaptureDevice
+    @Binding public var device: AVCaptureDevice?
     @Binding public var devices: [AVCaptureDevice]
 
     public init(
         backCamera: Binding<Bool>,
-        device: Binding<AVCaptureDevice>,
+        device: Binding<AVCaptureDevice?>,
         devices: Binding<[AVCaptureDevice]>
     ) {
         self._backCamera = backCamera

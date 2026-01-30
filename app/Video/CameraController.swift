@@ -24,7 +24,7 @@ public class CameraController: NSObject {
 
     public var devices = [AVCaptureDevice]()
 
-    public var device: AVCaptureDevice = AVCaptureDevice.default(for: .video)! {
+    public var device: AVCaptureDevice? = AVCaptureDevice.default(for: .video) {
         didSet {
             stop()
             start()
@@ -149,8 +149,9 @@ public class CameraController: NSObject {
             position: position)
 
         let videoDevice: AVCaptureDevice?
-        if videoDeviceDiscoverySession.devices.contains(self.device) {
-            videoDevice = self.device
+        if let preferredDevice = self.device,
+           videoDeviceDiscoverySession.devices.contains(preferredDevice) {
+            videoDevice = preferredDevice
         } else {
             videoDevice = videoDeviceDiscoverySession.devices.first
         }
@@ -181,9 +182,11 @@ public class CameraController: NSObject {
 
         #if os(iOS)
         rotationCoordinator = AVCaptureDevice.RotationCoordinator(device: videoDevice, previewLayer: nil)
-        rotationObservation = observe(\.rotationCoordinator!.videoRotationAngleForHorizonLevelCapture, options: [.initial, .new]) { [weak self] _, change in
-            if let nv = change.newValue {
-                self?.updateRotation(rotation: nv)
+        if rotationCoordinator != nil {
+            rotationObservation = observe(\.rotationCoordinator!.videoRotationAngleForHorizonLevelCapture, options: [.initial, .new]) { [weak self] _, change in
+                if let nv = change.newValue {
+                    self?.updateRotation(rotation: nv)
+                }
             }
         }
         #endif
