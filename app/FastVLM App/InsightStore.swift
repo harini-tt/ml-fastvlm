@@ -1,6 +1,6 @@
 //
 // InsightStore.swift
-// FastVLM App
+// Zing AI
 //
 // Persistent memory for research insights using SQLite3
 //

@@ -240,7 +240,7 @@ struct ContentView: View {
                 await distributeVideoFrames()
             }
 
-            .navigationTitle("FastVLM")
+            .navigationTitle("Zing AI")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif

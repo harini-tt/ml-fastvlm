@@ -9,9 +9,9 @@ import SwiftUI
 struct InfoView: View {
     @Environment(\.dismiss) var dismiss
 
-    let paragraph1 = "**FastVLM¹** is a new family of Vision-Language models that makes use of **FastViTHD**, a hierarchical hybrid vision encoder that produces small number of high quality tokens at low latencies, resulting in significantly faster time-to-first-token (TTFT)."
-    let paragraph2 = "This app showcases the **FastVLM** model in action, allowing users to freely customize the prompt. FastVLM utilizes Qwen2-Instruct LLMs without additional safety tuning, so please exercise caution when modifying the prompt."
-    let footer = "1. **FastVLM: Efficient Vision Encoding for Vision Language Models.** (CVPR 2025) Pavan Kumar Anasosalu Vasu, Fartash Faghri, Chun-Liang Li, Cem Koc, Nate True, Albert Antony, Gokul Santhanam, James Gabriel, Peter Grasch, Oncel Tuzel, Hadi Pouransari"
+    let paragraph1 = "Zing AI is an on-device ML research assistant. Point your camera at figures, graphs, and tables from machine learning papers to get instant analysis."
+    let paragraph2 = "Features:\n• Runs entirely on-device using Apple Silicon\n• References your indexed paper library for context\n• Saves insights to persistent memory across sessions\n• Uses efficient vision-language models via MLX"
+    let footer = "Powered by FastVLM (CVPR 2025) and MLX."
 
     var body: some View {
         NavigationStack {
