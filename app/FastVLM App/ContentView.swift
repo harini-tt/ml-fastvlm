@@ -24,15 +24,15 @@ struct ContentView: View {
     /// stream of frames -> VideoFrameView, see distributeVideoFrames
     @State private var framesToDisplay: AsyncStream<CVImageBuffer>?
 
-    @State private var prompt = "Describe the image in English."
-    @State private var promptSuffix = "Output should be brief, about 15 words or less."
-    @State private var useResearchContext = false
+    @State private var prompt = "Describe what this shows. State specific values and trends."
+    @State private var promptSuffix = ""
+    @State private var useResearchContext = true
 
     @State private var isShowingInfo: Bool = false
     @State private var isMemoryExpanded: Bool = false
     @State private var expandedInsightId: UUID? = nil
 
-    @State private var selectedCameraType: CameraType = .continuous
+    @State private var selectedCameraType: CameraType = .single
     @State private var isEditingPrompt: Bool = false
 
     var toolbarItemPlacement: ToolbarItemPlacement {
@@ -63,19 +63,6 @@ struct ContentView: View {
             Form {
                 Section {
                     VStack(alignment: .leading, spacing: 10.0) {
-                        Picker("Camera Type", selection: $selectedCameraType) {
-                            ForEach(CameraType.allCases, id: \.self) { cameraType in
-                                Text(cameraType.rawValue.capitalized).tag(cameraType)
-                            }
-                        }
-                        // Prevent macOS from adding a text label for the picker
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
-                        .onChange(of: selectedCameraType) { _, _ in
-                            // Cancel any in-flight requests when switching modes
-                            model.cancel()
-                        }
-
                         if let framesToDisplay {
                             VideoFrameView(
                                 frames: framesToDisplay,
@@ -278,35 +265,12 @@ struct ContentView: View {
                         }
                     }
                     else {
-                        Menu {
-                            Button("Describe image") {
-                                prompt = "Describe the image in English."
-                                promptSuffix = "Output should be brief, about 15 words or less."
-                            }
-                            Button("Facial expression") {
-                                prompt = "What is this person's facial expression?"
-                                promptSuffix = "Output only one or two words."
-                            }
-                            Button("Read text") {
-                                prompt = "What is written in this image?"
-                                promptSuffix = "Output only the text in the image."
-                            }
-                            Button("Research mode") {
-                                prompt = "What is this showing and what's the key insight?"
-                                promptSuffix = ""
-                                useResearchContext = true
-                            }
-                            Divider()
-                            Toggle("Use Research Context", isOn: $useResearchContext)
-                            if researchContext.isLoaded {
-                                Text("\(researchContext.chunkCount) chunks loaded")
-                            }
-                            #if !os(macOS)
-                            Button("Customize...") {
-                                isEditingPrompt.toggle()
-                            }
-                            #endif
-                        } label: { Text("Prompts") }
+                        Button {
+                            isEditingPrompt.toggle()
+                        } label: {
+                            Image(systemName: "pencil.circle")
+                                .font(.title2)
+                        }
                     }
                 }
             }
@@ -317,66 +281,20 @@ struct ContentView: View {
     }
 
     var promptSummary: some View {
-        Section("Prompt") {
-            VStack(alignment: .leading, spacing: 4.0) {
-                let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmedPrompt.isEmpty {
-                    Text(trimmedPrompt)
-                        .foregroundStyle(.secondary)
-                }
-
-                let trimmedSuffix = promptSuffix.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmedSuffix.isEmpty {
-                    Text(trimmedSuffix)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-            }
+        Section {
+            Text(prompt)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("Question")
         }
     }
 
     var promptForm: some View {
-        Group {
-            #if os(iOS)
-            Section("Prompt") {
-                TextEditor(text: $prompt)
-                    .frame(minHeight: 38)
-            }
-
-            Section("Prompt Suffix") {
-                TextEditor(text: $promptSuffix)
-                    .frame(minHeight: 38)
-            }
-            #elseif os(macOS)
-            Section {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading) {
-                        Text("Prompt")
-                            .font(.headline)
-
-                        TextEditor(text: $prompt)
-                            .frame(height: 38)
-                            .padding(.horizontal, 8.0)
-                            .padding(.vertical, 10.0)
-                            .background(Color(.textBackgroundColor))
-                            .cornerRadius(10.0)
-                    }
-
-                    VStack(alignment: .leading) {
-                        Text("Prompt Suffix")
-                            .font(.headline)
-
-                        TextEditor(text: $promptSuffix)
-                            .frame(height: 38)
-                            .padding(.horizontal, 8.0)
-                            .padding(.vertical, 10.0)
-                            .background(Color(.textBackgroundColor))
-                            .cornerRadius(10.0)
-                    }
-                }
-            }
-            .padding(.vertical)
-            #endif
+        Section {
+            TextField("Ask a question...", text: $prompt, axis: .vertical)
+                .lineLimit(2...4)
+        } header: {
+            Text("Question")
         }
     }
 

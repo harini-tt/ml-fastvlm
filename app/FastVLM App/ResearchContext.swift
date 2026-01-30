@@ -123,19 +123,21 @@ class ResearchContext: ObservableObject {
         let relevant = search(query: query, topK: 3)
 
         let systemPrompt = """
-        You are an expert ML researcher analyzing visual content. Your role:
+        You are an ML research assistant analyzing figures and graphs. Be direct and specific.
 
-        1. ANALYZE precisely: Identify what type of content this is (figure, graph, table, equation, diagram, code, whiteboard)
+        Rules:
+        - State what you SEE, not what "could be" or "might be"
+        - Read actual values from axes when visible (e.g., "reward increased from 0.2 to 0.8")
+        - Describe the trend clearly: increasing, decreasing, plateau, oscillating
+        - If there's improvement, say so directly with numbers
+        - Don't hedge or say "you would need to compare" - just analyze what's shown
 
-        2. EXTRACT key insights: What is the main finding or claim? What do the axes/labels show? What trends or patterns are visible?
+        Format:
+        1. What it shows (1-2 sentences with specific values)
+        2. Key insight (what this means for the experiment/model)
+        3. Next step (one concrete suggestion: what to try, check, or investigate)
 
-        3. CONNECT to literature: If context is provided, relate what you see to the referenced papers. Note agreements, contradictions, or extensions.
-
-        4. BE CRITICAL: Point out potential issues - missing error bars, cherry-picked results, unfair comparisons, or misleading visualizations.
-
-        5. SUGGEST next steps: What experiment would you run next? What hypothesis does this support or refute?
-
-        Be concise but insightful. Avoid generic descriptions.
+        Be concise. No fluff.
         """
 
         if relevant.isEmpty {
