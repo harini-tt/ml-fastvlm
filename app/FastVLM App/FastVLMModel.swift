@@ -20,10 +20,6 @@ class FastVLMModel {
     public var output = ""
     public var promptTime: String = ""
 
-    public var insightStore: InsightStore?
-    public var lastQuery: String = ""
-    public var lastSources: [String] = []
-    public var shouldSaveInsight: Bool = false
 
     enum LoadState {
         case idle
@@ -166,17 +162,6 @@ class FastVLMModel {
                 // Check if task was cancelled before updating UI
                 if !Task.isCancelled {
                     self.output = result.output
-
-                    // Save insight if in research mode
-                    if self.shouldSaveInsight && !result.output.isEmpty {
-                        let insight = Insight(
-                            query: self.lastQuery,
-                            output: result.output,
-                            sources: self.lastSources
-                        )
-                        self.insightStore?.save(insight)
-                        self.shouldSaveInsight = false
-                    }
                 }
 
             } catch {

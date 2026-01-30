@@ -187,11 +187,29 @@ struct ContentView: View {
                         .frame(minHeight: 50.0, maxHeight: 200.0)
                     }
                 } header: {
-                    Text("Response")
-                        #if os(macOS)
-                        .font(.headline)
-                        .padding(.bottom, 2.0)
-                        #endif
+                    HStack {
+                        Text("Response")
+                        Spacer()
+                        if !model.output.isEmpty {
+                            Button(action: saveToMemory) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "brain")
+                                    Text("Save")
+                                }
+                                .font(.caption)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.purple.opacity(0.2))
+                                .foregroundStyle(.purple)
+                                .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    #if os(macOS)
+                    .font(.headline)
+                    .padding(.bottom, 2.0)
+                    #endif
                 }
 
                 #if os(macOS)
@@ -210,7 +228,6 @@ struct ContentView: View {
             .task {
                 await model.load()
                 researchContext.load()
-                model.insightStore = insightStore
             }
 
             #if !os(macOS)
@@ -499,23 +516,28 @@ struct ContentView: View {
         return basePrompt
     }
 
-    func prepareModelForGeneration() {
-        model.lastQuery = prompt
-        model.shouldSaveInsight = useResearchContext
+    func saveToMemory() {
+        guard !model.output.isEmpty else { return }
 
+        var sources: [String] = []
         if useResearchContext && researchContext.isLoaded {
             let relevantChunks = researchContext.search(query: prompt, topK: 3)
-            model.lastSources = relevantChunks.map { $0.source.replacingOccurrences(of: ".pdf", with: "") }
-        } else {
-            model.lastSources = []
+            sources = relevantChunks.map { $0.source.replacingOccurrences(of: ".pdf", with: "") }
         }
+
+        let insight = Insight(
+            query: prompt,
+            output: model.output,
+            sources: sources
+        )
+        insightStore.save(insight)
     }
+
 
     func analyzeVideoFrames(_ frames: AsyncStream<CVImageBuffer>) async {
         for await frame in frames {
             let fullPrompt = await MainActor.run {
-                prepareModelForGeneration()
-                return buildPrompt()
+                buildPrompt()
             }
             let userInput = UserInput(
                 prompt: .text(fullPrompt),
@@ -590,9 +612,6 @@ struct ContentView: View {
         Task { @MainActor in
             model.output = ""
         }
-
-        // Prepare for insight saving if in research mode
-        prepareModelForGeneration()
 
         // Construct request to model with context
         let fullPrompt = buildPrompt()
